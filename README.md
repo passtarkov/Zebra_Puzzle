@@ -1102,18 +1102,6 @@ python main.py
 python log_analyzer.py
 ```
 
-### Только FOL-анализ (если симуляционные логи уже есть)
-
-```bash
-python -m fol_solver
-```
-
-### Тесты FOL-слоя
-
-```bash
-python -m pytest tests/
-```
-
 ### Параметры симуляции
 
 В `main.py` можно настроить:
