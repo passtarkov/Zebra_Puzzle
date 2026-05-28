@@ -1,17 +1,18 @@
 import os
 
 from analysis import SimulationAnalyzer
+from fol_solver import run_fol_analysis
 from knowledge_logging import KnowledgeLogAnalyzer
 from loaders.csv_utils import load_strategies, load_initial_data, load_geography
 from simulation.environment import Environment
 
-
+ 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    strategies = load_strategies(os.path.join(base_dir, "data/input_data/ZEBRA-strategies.csv"))
+    strategies = load_strategies(os.path.join(base_dir, "data/other_data/uniform_strategies.csv"))
     agents, houses = load_initial_data(os.path.join(base_dir, "data/input_data/zebra-01.csv"), strategies=strategies)
-    T = load_geography(os.path.join(base_dir, "data/input_data/ZEBRA-geo.csv"))
+    T = load_geography(os.path.join(base_dir, "data/other_data/random_geo.csv"))
 
     max_time = 2000
     envi = Environment(agents, houses, T, max_time)
@@ -38,4 +39,11 @@ if __name__ == "__main__":
     output_dir="data/output_data/logs/"
     )
     knowledge.generate_knowledge_logs()
+
+    run_fol_analysis(
+        observer_csv=log_file_path,
+        logs_dir=output_dir,
+        zebra_csv=os.path.join(base_dir, "data/input_data/zebra-01.csv"),
+        output_dir=os.path.join(base_dir, "data/output_data/fol_metrics/"),
+    )
 

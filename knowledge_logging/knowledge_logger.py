@@ -1,7 +1,7 @@
 import os
 import csv
 from collections import defaultdict
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Set, Optional, Any, Tuple
 
 
 class KnowledgeLogAnalyzer:
@@ -15,289 +15,312 @@ class KnowledgeLogAnalyzer:
         self.observer_log_path = observer_log_path
         self.agents_csv_path = agents_csv_path
         self.output_dir = output_dir
-
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self.agents_metadata = self._load_agents_metadata()
-
-        self.nationality_to_id = {
-            meta["nationality"].strip().lower(): agent_id
-            for agent_id, meta in self.agents_metadata.items()
+        self.agents_meta: Dict[int, Dict[str, str]] = self._load_agents_metadata()
+        self._nat_to_id: Dict[str, int] = {
+            m["nationality"].strip().lower(): aid
+            for aid, m in self.agents_meta.items()
         }
 
-        self.agents_knowledge: Dict[int, Dict[int, Dict[str, Any]]] = {}
-        self.houses: Dict[int, Dict[str, Any]] = {}
-        self.previous_knowledge_states: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        # World state (mutated during replay)
+        self.location: Dict[int, Optional[int]] = {}   # None = in transit
+        self.agent_house: Dict[int, int] = {}           # agent → house owned
+        self.pet: Dict[int, str] = {}                   # agent → pet currently held
+        self.owner_of: Dict[int, int] = {}              # house → owning agent
 
-        self._initialize_environment_state()
-        self.events_by_time = self._parse_observer_log()
+        # Per-agent knowledge and change-tracking snapshots
+        self.knowledge: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        self._prev: Dict[int, Dict[int, Dict[str, Any]]] = {}
+
+    # ------------------------------------------------------------------ loading
 
     def _load_agents_metadata(self) -> Dict[int, Dict[str, str]]:
-        metadata = {}
-        with open(self.agents_csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter=';')
-            for row in reader:
+        meta: Dict[int, Dict[str, str]] = {}
+        with open(self.agents_csv_path, encoding="utf-8") as f:
+            for row in csv.reader(f, delimiter=";"):
                 if len(row) < 6:
                     continue
-                agent_id = int(row[0])
-                metadata[agent_id] = {
-                    'color': row[1],
-                    'nationality': row[2],
-                    'drink': row[3],
-                    'cigarettes': row[4],
-                    'pet': row[5]
+                aid = int(row[0])
+                meta[aid] = {
+                    "color": row[1], "nationality": row[2],
+                    "drink": row[3], "cigarettes": row[4], "pet": row[5].strip()
                 }
-        return metadata
+        return meta
 
-    def _initialize_environment_state(self) -> None:
-        for agent_id, meta in self.agents_metadata.items():
-            self.houses[agent_id] = {
-                "owner_id": agent_id,
-                "present_agents": {agent_id}
-            }
-
-            self.agents_knowledge[agent_id] = {
-                agent_id: {
-                    "pet": meta["pet"],
-                    "house": agent_id,
-                    "location": agent_id,
-                    "t": 0
-                }
-            }
-
-            self.previous_knowledge_states[agent_id] = {}
+    def _nationality_to_id(self, nat: str) -> int:
+        return self._nat_to_id.get(nat.strip().lower(), -1)
 
     def _parse_observer_log(self) -> Dict[int, List[Dict[str, Any]]]:
-        events_by_time = defaultdict(list)
-
-        with open(self.observer_log_path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter=';')
-            next(reader, None)
-
-            for row in reader:
-                if not row or len(row) < 3:
+        # observer.csv has NO header row — do NOT skip any lines
+        by_time: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        with open(self.observer_log_path, encoding="utf-8") as f:
+            for row in csv.reader(f, delimiter=";"):
+                if len(row) < 3:
                     continue
-
                 try:
-                    event_num = int(row[0])
-                    time = int(row[1])
-                    event_type = row[2].strip()
+                    event_num, t = int(row[0]), int(row[1])
                 except ValueError:
                     continue
+                et = row[2].strip()
+                et_low = et.lower()
+                base: Dict[str, Any] = {"event_num": event_num, "time": t, "event_type": et}
 
-                event = {
-                    "event_num": event_num,
-                    "time": time,
-                    "event_type": event_type
+                if et_low == "starttrip" and len(row) >= 6:
+                    base["agent_id"] = self._nationality_to_id(row[3])
+                    by_time[t].append(base)
+
+                elif et_low == "finishtrip":
+                    # 5-field: agent returning to own house (no success flag emitted)
+                    # 6-field: agent visiting another house  (success flag = row[3])
+                    if len(row) == 5:
+                        base["agent_id"] = self._nationality_to_id(row[3])
+                        base["house"] = int(row[4])
+                        by_time[t].append(base)
+                    elif len(row) >= 6:
+                        base["agent_id"] = self._nationality_to_id(row[4])
+                        base["house"] = int(row[5])
+                        by_time[t].append(base)
+
+                elif et_low == "changehouse" and len(row) >= 4:
+                    qty = int(row[3])
+                    nats = row[4:4 + qty]
+                    houses = row[4 + qty:4 + 2 * qty]
+                    base["assignments"] = [
+                        (self._nationality_to_id(n), int(h))
+                        for n, h in zip(nats, houses)
+                    ]
+                    by_time[t].append(base)
+
+                elif et_low == "changepet" and len(row) >= 4:
+                    qty = int(row[3])
+                    nats = row[4:4 + qty]
+                    pets = row[4 + qty:4 + 2 * qty]
+                    base["assignments"] = [
+                        (self._nationality_to_id(n), p.strip())
+                        for n, p in zip(nats, pets)
+                    ]
+                    by_time[t].append(base)
+
+        return by_time
+
+    # ---------------------------------------------------------------- state init
+
+    def _init_world_state(self) -> None:
+        for aid, meta in self.agents_meta.items():
+            self.location[aid] = aid
+            self.agent_house[aid] = aid
+            self.pet[aid] = meta["pet"]
+            self.owner_of[aid] = aid
+
+    def _init_knowledge(self) -> None:
+        for aid in self.agents_meta:
+            self.knowledge[aid] = {
+                aid: {
+                    "pet": self.pet[aid],
+                    "house": aid,
+                    "location": aid,
+                    "t": 0,
                 }
+            }
+            self._prev[aid] = {}
 
-                if event_type == "FinishTrip":
-                    if len(row) >= 6:
-                        event.update({
-                            "success": int(row[3]),
-                            "nationality": row[4],
-                            "house_id": int(row[5])
-                        })
-                    elif len(row) >= 5:
-                        event.update({
-                            "success": 1,
-                            "nationality": row[3],
-                            "house_id": int(row[4])
-                        })
+    # --------------------------------------------------------- event processors
 
-                elif event_type in ["changeHouse", "ChangePet"]:
-                    if len(row) >= 4:
-                        qty = int(row[3])
-                        event["qty_participants"] = qty
-                        event["nationalities"] = row[4:4 + qty]
-                        rest = row[4 + qty:4 + qty + qty]
+    def _process_finish_trip(self, ev: Dict[str, Any], t: int) -> None:
+        aid = ev.get("agent_id", -1)
+        if aid == -1:
+            return
+        house = ev["house"]
+        self.location[aid] = house
+        # Update self-knowledge with new location
+        self.knowledge[aid][aid]["location"] = house
+        self.knowledge[aid][aid]["t"] = t
 
-                        if event_type == "changeHouse":
-                            event["houses_after"] = [int(x) for x in rest]
-                        else:
-                            event["pets_after"] = rest
-
-                events_by_time[time].append(event)
-
-        return events_by_time
-
-    def _get_agent_id_by_nationality(self, nationality: str) -> Optional[int]:
-        return self.nationality_to_id.get(nationality.strip().lower())
-
-    def _exchange_knowledge(self, a1: int, a2: int, time: int) -> None:
-        self.agents_knowledge[a1][a2] = {
-            "pet": self.agents_knowledge[a2][a2]["pet"],
-            "house": self.agents_knowledge[a2][a2]["house"],
-            "location": self.agents_knowledge[a2][a2]["location"],
-            "t": time
-        }
-
-        self.agents_knowledge[a2][a1] = {
-            "pet": self.agents_knowledge[a1][a1]["pet"],
-            "house": self.agents_knowledge[a1][a1]["house"],
-            "location": self.agents_knowledge[a1][a1]["location"],
-            "t": time
-        }
-
-    def _process_finish_trips(self, events: List[Dict[str, Any]], time: int) -> None:
-        for event in sorted(events, key=lambda e: e["event_num"]):
-            agent_id = self._get_agent_id_by_nationality(event["nationality"])
-            if not agent_id:
-                continue
-
-            target_house = event["house_id"]
-            success = event.get("success", 1)
-
-            old_house = self.agents_knowledge[agent_id][agent_id]["location"]
-            self.houses[old_house]["present_agents"].discard(agent_id)
-
-            self.houses[target_house]["present_agents"].add(agent_id)
-
-            self.agents_knowledge[agent_id][agent_id]["location"] = target_house
-            self.agents_knowledge[agent_id][agent_id]["t"] = time
-
-            if success == 1:
-                present = list(self.houses[target_house]["present_agents"])
-                for i, a1 in enumerate(present):
-                    for a2 in present[i + 1:]:
-                        self._exchange_knowledge(a1, a2, time)
-
-    def _process_house_exchange(self, event: Dict[str, Any], time: int) -> None:
-        participants = [
-            self._get_agent_id_by_nationality(n)
-            for n in event["nationalities"]
-        ]
-
-        houses_after = event.get("houses_after", [])
-
-        if not participants or len(participants) != len(houses_after):
+    def _process_change_house(self, ev: Dict[str, Any], t: int) -> None:
+        assignments: List[Tuple[int, int]] = ev.get("assignments", [])
+        if not assignments or any(aid == -1 for aid, _ in assignments):
             return
 
-        event_locations = set(
-            self.agents_knowledge[agent_id][agent_id]["location"]
-            for agent_id in participants
-        )
+        participants = [aid for aid, _ in assignments]
+        # All participants are at the same house (guaranteed by simulation design)
+        locs = {self.location[p] for p in participants if self.location[p] is not None}
+        exchange_house: Optional[int] = locs.pop() if len(locs) == 1 else None
 
-        for i, agent_id in enumerate(participants):
-            self.agents_knowledge[agent_id][agent_id]["house"] = houses_after[i]
-            self.agents_knowledge[agent_id][agent_id]["t"] = time
+        # Mutate world state and participant self-knowledge
+        for aid, new_house in assignments:
+            self.agent_house[aid] = new_house
+            self.owner_of[new_house] = aid
+            self.knowledge[aid][aid]["house"] = new_house
+            self.knowledge[aid][aid]["t"] = t
 
-        for i, agent_id in enumerate(participants):
-            new_house = houses_after[i]
-            self.houses[new_house]["owner_id"] = agent_id
-
-        observers = set()
-        for house_id in event_locations:
-            observers.update(self.houses[house_id]["present_agents"])
-
-        for observer in observers:
-            for i, participant in enumerate(participants):
-                if participant in self.agents_knowledge[observer]:
-                    self.agents_knowledge[observer][participant]["house"] = houses_after[i]
-                    self.agents_knowledge[observer][participant]["t"] = time
-
-    def _process_pet_exchange(self, event: Dict[str, Any], time: int) -> None:
-        participants = [
-            self._get_agent_id_by_nationality(n)
-            for n in event["nationalities"]
-        ]
-
-        pets_after = event.get("pets_after", [])
-
-        if not participants or len(participants) != len(pets_after):
+        if exchange_house is None:
             return
 
-        event_locations = set(
-            self.agents_knowledge[agent_id][agent_id]["location"]
-            for agent_id in participants
-        )
+        witnesses = {a for a, loc in self.location.items() if loc == exchange_house}
+        for w in witnesses:
+            for aid, new_house in assignments:
+                if w == aid:
+                    continue  # self-knowledge already updated in participant loop
+                if aid in self.knowledge[w]:
+                    self.knowledge[w][aid]["house"] = new_house
+                    self.knowledge[w][aid]["t"] = t
+                else:
+                    self.knowledge[w][aid] = {
+                        "pet":      self.pet[aid],
+                        "house":    self.agent_house[aid],
+                        "location": exchange_house,
+                        "t":        t,
+                    }
 
-        for i, agent_id in enumerate(participants):
-            self.agents_knowledge[agent_id][agent_id]["pet"] = pets_after[i]
-            self.agents_knowledge[agent_id][agent_id]["t"] = time
+    def _process_change_pet(self, ev: Dict[str, Any], t: int) -> None:
+        assignments: List[Tuple[int, str]] = ev.get("assignments", [])
+        if not assignments or any(aid == -1 for aid, _ in assignments):
+            return
 
-        observers = set()
-        for house_id in event_locations:
-            observers.update(self.houses[house_id]["present_agents"])
+        participants = [aid for aid, _ in assignments]
+        locs = {self.location[p] for p in participants if self.location[p] is not None}
+        exchange_house: Optional[int] = locs.pop() if len(locs) == 1 else None
 
-        for observer in observers:
-            for i, participant in enumerate(participants):
-                if participant in self.agents_knowledge[observer]:
-                    self.agents_knowledge[observer][participant]["pet"] = pets_after[i]
-                    self.agents_knowledge[observer][participant]["t"] = time
+        for aid, new_pet in assignments:
+            self.pet[aid] = new_pet
+            self.knowledge[aid][aid]["pet"] = new_pet
+            self.knowledge[aid][aid]["t"] = t
 
-    def _knowledge_changed(self, agent_id: int) -> bool:
-        previous = self.previous_knowledge_states.get(agent_id, {})
-        current = self.agents_knowledge[agent_id]
+        if exchange_house is None:
+            return
 
-        if len(previous) != len(current):
+        witnesses = {a for a, loc in self.location.items() if loc == exchange_house}
+        for w in witnesses:
+            for aid, new_pet in assignments:
+                if w == aid:
+                    continue  # self-knowledge already updated in participant loop
+                if aid in self.knowledge[w]:
+                    self.knowledge[w][aid]["pet"] = new_pet
+                    self.knowledge[w][aid]["t"] = t
+                else:
+                    self.knowledge[w][aid] = {
+                        "pet":      self.pet[aid],
+                        "house":    self.agent_house[aid],
+                        "location": exchange_house,
+                        "t":        t,
+                    }
+
+    def _process_start_trip(self, ev: Dict[str, Any], t: int) -> None:
+        aid = ev.get("agent_id", -1)
+        if aid == -1:
+            return
+        # Agent enters transit — world-state location becomes None.
+        # Self-knowledge location is deliberately NOT set to None: the validation
+        # parser requires int locations, and ground_truth.py doesn't update
+        # self-knowledge on departure either.
+        self.location[aid] = None
+
+    # --------------------------------------------------- knowledge update helper
+
+    def _propagate_copresence(self, t: int) -> None:
+        """After all FinishTrips in a tick, agents co-located at a house exchange
+        full state — but only when the house owner is currently present."""
+        house_to_agents: Dict[int, Set[int]] = defaultdict(set)
+        for aid, loc in self.location.items():
+            if loc is not None:
+                house_to_agents[loc].add(aid)
+
+        for h, agents in house_to_agents.items():
+            if self.owner_of.get(h) not in agents:
+                continue  # owner absent — no knowledge exchange at this house
+            agents_list = sorted(agents)
+            for i, a in enumerate(agents_list):
+                for b in agents_list[i + 1:]:
+                    self.knowledge[a][b] = {
+                        "pet": self.pet[b],
+                        "house": self.agent_house[b],
+                        "location": self.location[b],  # guaranteed non-None
+                        "t": t,
+                    }
+                    self.knowledge[b][a] = {
+                        "pet": self.pet[a],
+                        "house": self.agent_house[a],
+                        "location": self.location[a],
+                        "t": t,
+                    }
+
+    # --------------------------------------------------------------- logging
+
+    def _snapshot(self, aid: int) -> Dict[int, Dict[str, Any]]:
+        return {k: dict(v) for k, v in self.knowledge[aid].items()}
+
+    def _knowledge_changed(self, aid: int) -> bool:
+        prev = self._prev.get(aid, {})
+        curr = self.knowledge[aid]
+        if set(prev) != set(curr):
             return True
+        return any(prev[k] != curr[k] for k in curr)
 
-        for other_id, info in current.items():
-            if other_id not in previous:
-                return True
+    def _log_phase(self, t: int, label: str) -> None:
+        for aid in self.knowledge:
+            if self._knowledge_changed(aid):
+                path = os.path.join(self.output_dir, f"agent_{aid}_knowledge.log")
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"{t};{label};{self.knowledge[aid]}\n")
+                self._prev[aid] = self._snapshot(aid)
 
-            prev_info = previous[other_id]
-            for field in ["pet", "house", "location"]:
-                if info.get(field) != prev_info.get(field):
-                    return True
-
-        return False
-
-    def _snapshot(self, agent_id: int) -> Dict:
-        return {
-            k: dict(v)
-            for k, v in self.agents_knowledge[agent_id].items()
-        }
-
-    def _log_knowledge_state(self, time: int, event_type: str) -> None:
-        for agent_id in self.agents_knowledge:
-            if self._knowledge_changed(agent_id):
-                filename = os.path.join(
-                    self.output_dir,
-                    f"agent_{agent_id}_knowledge.log"
-                )
-
-                with open(filename, "a", encoding="utf-8") as f:
-                    f.write(
-                        f"{time};{event_type};"
-                        f"{self.agents_knowledge[agent_id]}\n"
-                    )
-
-                self.previous_knowledge_states[agent_id] = self._snapshot(agent_id)
+    # ---------------------------------------------------------------- entry point
 
     def generate_knowledge_logs(self) -> None:
-        for agent_id in self.agents_knowledge:
-            filename = os.path.join(
-                self.output_dir,
-                f"agent_{agent_id}_knowledge.log"
+        self._init_world_state()
+        self._init_knowledge()
+
+        # Write initial state (before any events)
+        for aid in self.knowledge:
+            path = os.path.join(self.output_dir, f"agent_{aid}_knowledge.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"0;INIT;{self.knowledge[aid]}\n")
+            self._prev[aid] = self._snapshot(aid)
+
+        events_by_time = self._parse_observer_log()
+
+        for t in sorted(events_by_time):
+            batch = events_by_time[t]
+
+            finish = sorted(
+                [e for e in batch if e["event_type"].lower() == "finishtrip"],
+                key=lambda e: e["event_num"],
+            )
+            house_ex = sorted(
+                [e for e in batch if e["event_type"].lower() == "changehouse"],
+                key=lambda e: e["event_num"],
+            )
+            pet_ex = sorted(
+                [e for e in batch if e["event_type"].lower() == "changepet"],
+                key=lambda e: e["event_num"],
+            )
+            starts = sorted(
+                [e for e in batch if e["event_type"].lower() == "starttrip"],
+                key=lambda e: e["event_num"],
             )
 
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(
-                    f"0;INIT;{self.agents_knowledge[agent_id]}\n"
-                )
-
-            self.previous_knowledge_states[agent_id] = self._snapshot(agent_id)
-
-        for t in sorted(self.events_by_time.keys()):
-            batch = self.events_by_time[t]
-
-            finish = [e for e in batch if e["event_type"] == "FinishTrip"]
-            house_ex = [e for e in batch if e["event_type"] == "changeHouse"]
-            pet_ex = [e for e in batch if e["event_type"] == "ChangePet"]
-
+            # Phase 1: arrivals — then full co-presence exchange for touched houses
+            for ev in finish:
+                self._process_finish_trip(ev, t)
             if finish:
-                self._process_finish_trips(finish, t)
-                self._log_knowledge_state(t, "FinishTrip")
+                self._propagate_copresence(t)
+                self._log_phase(t, "FinishTrip")
 
+            # Phase 2: house ownership exchanges
+            for ev in house_ex:
+                self._process_change_house(ev, t)
             if house_ex:
-                for e in sorted(house_ex, key=lambda x: x["event_num"]):
-                    self._process_house_exchange(e, t)
-                self._log_knowledge_state(t, "ChangeHouse")
+                self._log_phase(t, "ChangeHouse")
 
+            # Phase 3: pet exchanges
+            for ev in pet_ex:
+                self._process_change_pet(ev, t)
             if pet_ex:
-                for e in sorted(pet_ex, key=lambda x: x["event_num"]):
-                    self._process_pet_exchange(e, t)
-                self._log_knowledge_state(t, "ChangePet")
+                self._log_phase(t, "ChangePet")
 
+            # Phase 4: departures — world-state only, knowledge does not change
+            for ev in starts:
+                self._process_start_trip(ev, t)
+            if starts:
+                self._log_phase(t, "StartTrip")
