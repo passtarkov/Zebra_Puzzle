@@ -1,7 +1,7 @@
 import os
 
 from .fact_filter import FactFilter
-from .loader import MetricsBundle, load_metrics, compute_filtered_metrics
+from .loader import MetricsBundle, FilteredMetrics, load_metrics, compute_filtered_metrics
 from .log_parser import (
     Domain,
     get_knowledge_at,
@@ -43,8 +43,7 @@ def _build_k_fol(
     k_raw: dict[int, dict[int, KnowledgeSnapshot]],
     domain: Domain,
     timesteps: list[int],
-) -> tuple[dict[int, dict[int, KnowledgeSnapshot]], dict[int, dict[int, KnowledgeSnapshot]]]:
-    infer_cache: dict[tuple[int, int], KnowledgeSnapshot] = {}
+) -> dict[int, dict[int, KnowledgeSnapshot]]:
     k_fol: dict[int, dict[int, KnowledgeSnapshot]] = {aid: {} for aid in domain.agent_ids}
     for agent_id in domain.agent_ids:
         series = k_raw.get(agent_id, {})
@@ -52,23 +51,8 @@ def _build_k_fol(
             raw = get_knowledge_at(series, t)
             if raw is None:
                 continue
-            cache_key = (raw.observer_id, raw.t)
-            if cache_key not in infer_cache:
-                infer_cache[cache_key] = infer_knowledge(raw, domain)
-            k_fol[agent_id][t] = infer_cache[cache_key]
-
-    k_enriched: dict[int, dict[int, KnowledgeSnapshot]] = {}
-    for agent_id in domain.agent_ids:
-        series = k_raw.get(agent_id, {})
-        k_enriched[agent_id] = {}
-        for snap_t, raw in series.items():
-            cache_key = (raw.observer_id, raw.t)
-            k_enriched[agent_id][snap_t] = (
-                infer_cache[cache_key] if cache_key in infer_cache
-                else infer_knowledge(raw, domain)
-            )
-
-    return k_fol, k_enriched
+            k_fol[agent_id][t] = infer_knowledge(raw, domain)
+    return k_fol
 
 
 def run_fol_analysis(
@@ -95,7 +79,7 @@ def run_fol_analysis(
     else:
         t_min, t_max = all_times[0], all_times[-1]
         timesteps = list(range(t_min, t_max + 1, timestep_resolution))
-    k_fol, k_enriched = _build_k_fol(k_raw, domain, timesteps)
+    k_fol = _build_k_fol(k_raw, domain, timesteps)
 
     m1 = compute_m1(world_states, k_fol, timesteps, domain)
     m1_raw = compute_m1(world_states, k_raw, timesteps, domain)
@@ -108,9 +92,9 @@ def run_fol_analysis(
     m5_raw = compute_m5(world_states, k_raw, timesteps, domain,
                         drop_rates=m5_drop_rates, n_trials=m5_n_trials,
                         seed=m5_seed, apply_fol=False)
-    m5_fol = compute_m5(world_states, k_enriched, timesteps, domain,
+    m5_fol = compute_m5(world_states, k_raw, timesteps, domain,
                         drop_rates=m5_drop_rates, n_trials=m5_n_trials,
-                        seed=m5_seed, apply_fol=False)
+                        seed=m5_seed, apply_fol=True)
 
     os.makedirs(output_dir, exist_ok=True)
     for name, metric in [('m1', m1), ('m1_raw', m1_raw), ('m2', m2), ('m4', m4),

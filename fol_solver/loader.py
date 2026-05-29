@@ -83,25 +83,75 @@ def load_metrics(metrics_dir: str) -> MetricsBundle:
     bundle = MetricsBundle()
     for name in TIMESERIES_METRICS:
         path = os.path.join(metrics_dir, f"{name}.csv")
-        if not os.path.exists(path):
-            continue
-        try:
-            setattr(bundle, name, _load_timeseries_csv(path))
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load metric '{name}' from {path}") from exc
-    for attr, filename, loader in [
-        ('m3', 'm3.csv', _load_m3_csv),
-        ('m5_raw', 'm5_raw.csv', _load_m5_csv),
-        ('m5_fol', 'm5_fol.csv', _load_m5_csv),
-    ]:
-        path = os.path.join(metrics_dir, filename)
-        if not os.path.exists(path):
-            continue
-        try:
-            setattr(bundle, attr, loader(path))
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load metric '{attr}' from {path}") from exc
+        setattr(bundle, name, _load_timeseries_csv(path))
+    bundle.m3 = _load_m3_csv(os.path.join(metrics_dir, "m3.csv"))
+    bundle.m5_raw = _load_m5_csv(os.path.join(metrics_dir, "m5_raw.csv"))
+    bundle.m5_fol = _load_m5_csv(os.path.join(metrics_dir, "m5_fol.csv"))
     return bundle
+
+
+class FilteredMetrics:
+    def __init__(
+        self,
+        observer_csv: str,
+        logs_dir: str,
+        zebra_csv: str,
+        fact_filter: FactFilter,
+        metrics: Optional[list[str]] = None,
+        max_horizon: int = 100,
+    ):
+        self._data = compute_filtered_metrics(
+            observer_csv=observer_csv,
+            logs_dir=logs_dir,
+            zebra_csv=zebra_csv,
+            fact_filter=fact_filter,
+            metrics=metrics,
+            max_horizon=max_horizon,
+        )
+        # cache: {metric_name: {agent_id: sorted list of timestamps}}
+        # speeds up step-function lookup
+        self._sorted_ts: dict[str, dict[int, list[int]]] = {
+            m: {aid: sorted(ts for ts, _ in series)
+                for aid, series in agents.items()}
+            for m, agents in self._data.items()
+        }
+
+    def get(self, metric_name: str, agent_id: int, t: int) -> float:
+        agents = self._data.get(metric_name)
+        if agents is None or agent_id not in agents:
+            return 0.0
+        series = agents[agent_id]
+        if not series:
+            return 0.0
+        sorted_ts = self._sorted_ts[metric_name][agent_id]
+        # find last timestamp <= t via bisect
+        import bisect
+        pos = bisect.bisect_right(sorted_ts, t) - 1
+        if pos < 0:
+            return 0.0
+        target_t = sorted_ts[pos]
+        # series is list[(t, value)], find value at target_t
+        # we know it's there because target_t came from this series
+        for ts, v in series:
+            if ts == target_t:
+                return v
+        return 0.0
+
+    def at(self, agent_id: int, t: int) -> dict[str, float]:
+        return {m: self.get(m, agent_id, t) for m in self._data}
+
+    def agents(self) -> list[int]:
+        all_aids: set[int] = set()
+        for agents in self._data.values():
+            all_aids.update(agents.keys())
+        return sorted(all_aids)
+
+    def timesteps(self, metric_name: str = 'm1') -> list[int]:
+        agents = self._data.get(metric_name, {})
+        return sorted({t for series in agents.values() for t, _ in series})
+
+    def metric_names(self) -> list[str]:
+        return list(self._data.keys())
 
 
 def compute_filtered_metrics(
